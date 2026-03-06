@@ -1,0 +1,16 @@
+# Data directories
+_raw/
+cropped/
+distracted/
+empty/
+focused/
+splits/
+
+# Model weights
+*.pth
+
+# Claude
+.claude/
+
+# macOS
+.DS_Store

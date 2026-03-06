@@ -1,0 +1,28 @@
+{
+  "classes": [
+    "focused",
+    "distracted",
+    "empty"
+  ],
+  "image_size": [
+    224,
+    224
+  ],
+  "splits": {
+    "train": {
+      "focused": 454,
+      "distracted": 662,
+      "empty": 311
+    },
+    "val": {
+      "focused": 97,
+      "distracted": 141,
+      "empty": 66
+    },
+    "test": {
+      "focused": 99,
+      "distracted": 143,
+      "empty": 68
+    }
+  }
+}
