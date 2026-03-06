@@ -1,21 +1,26 @@
 /*
  * distraction_detector.ino
- * Real-time distraction detection on ESP32-S3 with camera.
+ * Real-time distraction detection on Arduino Nano ESP32 (ESP32-S3).
  *
- * Hardware:
- *   - ESP32-S3 DevKitC or XIAO ESP32S3 Sense
- *   - OV2640 / OV5640 camera module
+ * Board: Arduino Nano ESP32
+ *   - ESP32-S3 (8MB flash, 8MB PSRAM)
+ *   - Install via Arduino Board Manager: "Arduino ESP32 Boards"
+ *   - Select board: "Arduino Nano ESP32"
+ *   - Set USB Mode: "Hardware CDC and JTAG"
+ *
+ * NOTE: MobileNetV3-Small (~1.6MB) does NOT fit on Nano 33 BLE (1MB flash).
+ *       Use Arduino Nano ESP32 or ESP32-S3 DevKitC instead.
+ *       For classic Nanos, see distraction_serial_bridge.ino.
+ *
+ * Camera: OV2640 via external module (connect to GPIO pins below)
  *
  * Libraries (install via Arduino Library Manager):
- *   - TensorFlowLite_ESP32 (or EloquentTinyML)
- *   - ESP32 Camera driver (included with ESP32 board package)
+ *   - TensorFlowLite_ESP32
  *
  * Setup:
- *   1. Run convert_to_tflite.py to generate model_data.h
- *   2. Select board: ESP32S3 Dev Module
- *   3. Set PSRAM: OPI PSRAM
- *   4. Set Flash Size: 8MB or 16MB
- *   5. Upload
+ *   1. Run: python convert_to_tflite.py --model best_distraction_model.pth
+ *   2. model_data.h is auto-generated in this folder
+ *   3. Upload to Arduino Nano ESP32
  */
 
 #include <TensorFlowLite_ESP32.h>
@@ -32,10 +37,11 @@
 #define INPUT_H       224
 #define INPUT_CH      3
 #define NUM_CLASSES   3
-#define TENSOR_ARENA_SIZE (512 * 1024)  // 512 KB for ESP32-S3 PSRAM
+#define TENSOR_ARENA_SIZE (512 * 1024)
 
 static const char* kLabels[NUM_CLASSES] = {"distracted", "empty", "focused"};
 
+// ImageNet normalization
 static const float kMean[3] = {0.485f, 0.456f, 0.406f};
 static const float kStd[3]  = {0.229f, 0.224f, 0.225f};
 
@@ -45,10 +51,12 @@ static tflite::MicroInterpreter* interpreter = nullptr;
 static TfLiteTensor* input_tensor = nullptr;
 static TfLiteTensor* output_tensor = nullptr;
 
-// ── Status LED ──────────────────────────────────────────────────────────────
-#define LED_PIN 21  // Built-in LED on most ESP32-S3 boards
+// ── Pins ────────────────────────────────────────────────────────────────────
+#define LED_RED    D2   // Distracted indicator
+#define LED_GREEN  D3   // Focused indicator
+#define BUZZER_PIN D4   // Optional buzzer
 
-// ── Camera config (XIAO ESP32S3 Sense pins) ────────────────────────────────
+// ── Camera setup ────────────────────────────────────────────────────────────
 void setup_camera() {
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
@@ -88,11 +96,12 @@ void setup_camera() {
 }
 
 // ── Preprocessing ───────────────────────────────────────────────────────────
-// Resize RGB565 frame to 224x224 float tensor with ImageNet normalization
+// Resize RGB565 frame → NCHW float tensor with ImageNet normalization
 void preprocess_frame(camera_fb_t* fb, float* tensor_data) {
     int src_w = fb->width;
     int src_h = fb->height;
     uint16_t* pixels = (uint16_t*)fb->buf;
+    int plane_size = INPUT_H * INPUT_W;
 
     for (int y = 0; y < INPUT_H; y++) {
         int src_y = y * src_h / INPUT_H;
@@ -100,15 +109,15 @@ void preprocess_frame(camera_fb_t* fb, float* tensor_data) {
             int src_x = x * src_w / INPUT_W;
             uint16_t px = pixels[src_y * src_w + src_x];
 
-            // RGB565 → float [0,1] → normalized
             float r = ((px >> 11) & 0x1F) / 31.0f;
             float g = ((px >> 5) & 0x3F)  / 63.0f;
             float b = (px & 0x1F)         / 31.0f;
 
-            int idx = (y * INPUT_W + x) * INPUT_CH;
-            tensor_data[idx + 0] = (r - kMean[0]) / kStd[0];
-            tensor_data[idx + 1] = (g - kMean[1]) / kStd[1];
-            tensor_data[idx + 2] = (b - kMean[2]) / kStd[2];
+            int pixel_idx = y * INPUT_W + x;
+            // NCHW layout: channel planes are contiguous
+            tensor_data[0 * plane_size + pixel_idx] = (r - kMean[0]) / kStd[0];
+            tensor_data[1 * plane_size + pixel_idx] = (g - kMean[1]) / kStd[1];
+            tensor_data[2 * plane_size + pixel_idx] = (b - kMean[2]) / kStd[2];
         }
     }
 }
@@ -133,33 +142,33 @@ void softmax(float* input, float* output, int len) {
 void setup() {
     Serial.begin(115200);
     while (!Serial) delay(10);
-    Serial.println("\n=== Distraction Detector ===\n");
+    Serial.println("\n=== Distraction Detector (Nano ESP32) ===\n");
 
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
+    pinMode(LED_RED, OUTPUT);
+    pinMode(LED_GREEN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, LOW);
 
-    // Initialize camera
     setup_camera();
 
-    // Allocate tensor arena in PSRAM if available
+    // Allocate tensor arena in PSRAM
     if (psramFound()) {
         tensor_arena = (uint8_t*)ps_malloc(TENSOR_ARENA_SIZE);
-        Serial.println("Using PSRAM for tensor arena.");
+        Serial.printf("PSRAM: %d KB free\n", ESP.getFreePsram() / 1024);
     } else {
         tensor_arena = (uint8_t*)malloc(TENSOR_ARENA_SIZE);
-        Serial.println("WARNING: No PSRAM — using heap.");
+        Serial.println("WARNING: No PSRAM");
     }
 
     if (!tensor_arena) {
-        Serial.println("ERROR: Failed to allocate tensor arena.");
+        Serial.println("ERROR: Failed to allocate tensor arena");
         while (1) delay(1000);
     }
 
-    // Load TFLite model
     const tflite::Model* model = tflite::GetModel(g_distraction_model);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
-        Serial.printf("Model schema mismatch: %d vs %d\n",
-                      model->version(), TFLITE_SCHEMA_VERSION);
+        Serial.printf("Schema mismatch: %d vs %d\n", model->version(), TFLITE_SCHEMA_VERSION);
         while (1) delay(1000);
     }
 
@@ -169,63 +178,57 @@ void setup() {
     interpreter = &static_interpreter;
 
     if (interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("ERROR: AllocateTensors() failed.");
+        Serial.println("ERROR: AllocateTensors() failed");
         while (1) delay(1000);
     }
 
     input_tensor  = interpreter->input(0);
     output_tensor = interpreter->output(0);
 
-    Serial.printf("Input:  %d x %d x %d x %d\n",
-        input_tensor->dims->data[0], input_tensor->dims->data[1],
-        input_tensor->dims->data[2], input_tensor->dims->data[3]);
-    Serial.printf("Arena used: %zu / %d bytes\n",
-        interpreter->arena_used_bytes(), TENSOR_ARENA_SIZE);
-    Serial.println("\nRunning inference...\n");
+    Serial.printf("Arena: %zu / %d bytes\n", interpreter->arena_used_bytes(), TENSOR_ARENA_SIZE);
+    Serial.println("Running...\n");
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 void loop() {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
-        Serial.println("Camera capture failed.");
+        Serial.println("Capture failed");
         delay(100);
         return;
     }
 
-    // Preprocess into input tensor
     float* input_data = input_tensor->data.f;
     preprocess_frame(fb, input_data);
     esp_camera_fb_return(fb);
 
-    // Run inference
     unsigned long t0 = millis();
     if (interpreter->Invoke() != kTfLiteOk) {
-        Serial.println("Invoke failed.");
+        Serial.println("Invoke failed");
         return;
     }
     unsigned long dt = millis() - t0;
 
-    // Get results
     float* raw_output = output_tensor->data.f;
     float probs[NUM_CLASSES];
     softmax(raw_output, probs, NUM_CLASSES);
 
-    // Find top prediction
     int best_idx = 0;
     for (int i = 1; i < NUM_CLASSES; i++) {
         if (probs[i] > probs[best_idx]) best_idx = i;
     }
 
-    // LED feedback: ON if distracted
-    digitalWrite(LED_PIN, best_idx == 0 ? HIGH : LOW);
+    // LED + buzzer feedback
+    digitalWrite(LED_RED, best_idx == 0 ? HIGH : LOW);    // distracted
+    digitalWrite(LED_GREEN, best_idx == 2 ? HIGH : LOW);  // focused
+    digitalWrite(BUZZER_PIN, best_idx == 0 ? HIGH : LOW); // buzz when distracted
 
-    // Print results
-    Serial.printf("[%4lums] %-11s %.1f%%  |", dt, kLabels[best_idx], probs[best_idx] * 100);
+    // Serial output
+    Serial.printf("[%4lums] %-11s %.1f%%", dt, kLabels[best_idx], probs[best_idx] * 100);
     for (int i = 0; i < NUM_CLASSES; i++) {
         Serial.printf("  %s:%.0f%%", kLabels[i], probs[i] * 100);
     }
     Serial.println();
 
-    delay(50);  // ~20 FPS target
+    delay(50);
 }

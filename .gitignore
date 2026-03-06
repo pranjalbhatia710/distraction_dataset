@@ -8,6 +8,12 @@ splits/
 
 # Model weights
 *.pth
+*.tflite
+*.onnx
+tf_saved_model/
+
+# Generated model header (too large for git, regenerate with convert_to_tflite.py)
+arduino/distraction_detector/model_data.h
 
 # Claude
 .claude/
